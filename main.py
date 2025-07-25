@@ -84,82 +84,104 @@ class ForwardLookingDataCollector:
             volume_window = MW(100)
             
             data_points = 0
-            sample_interval = 500_000_000  # 50ms采样间隔
             
-            print("第一阶段：收集市场数据和特征...")
+            print("第一阶段：收集市场数据和特征（事件驱动模式）...")
             
-            while hbt.elapse(sample_interval) == 0:
-                current_time = hbt.current_timestamp
-                depth = hbt.depth(asset_no)
-                trades = hbt.last_trades(asset_no)
+            while True:
+                # 等待下一个市场数据事件
+                result = hbt.wait_next_feed(
+                    include_order_resp=False,
+                    timeout=10000000000  # 10秒超时
+                )
                 
-                if depth.best_bid <= 0 or depth.best_ask <= 0:
+                current_time = hbt.current_timestamp
+
+                # 检查结果
+                if result == 0:  # 超时
+                    if data_points == 0:
+                        print("警告: 没有收到任何事件，可能数据有问题")
+                        break
+                    continue
+                elif result == 1:  # 数据结束
+                    print("数据结束，当前时间:", current_time)
+                    break
+                elif result == 2:  # 收到市场数据feed
+                    depth = hbt.depth(asset_no)
+                    trades = hbt.last_trades(asset_no)
+                    
+                    # 检查订单簿数据有效性
+                    if depth.best_bid <= 0 or depth.best_ask <= 0:
+                        hbt.clear_last_trades(asset_no)
+                        rec.record(hbt)
+                        continue
+                    
+                    # 记录市场数据
+                    mid_price = (depth.best_bid + depth.best_ask) / 2.0
+                    market_data.append((current_time, depth.best_bid, depth.best_ask, mid_price))
+                    
+                    # 计算特征
+                    ob_features = calculate_order_book_features(depth, lv)
+                    trade_features = calculate_trade_features(trades, current_time)
+                    
+                    price_window.push(mid_price)
+                    volume_window.push(trade_features[1])
+                    
+                    # 估计GBM参数
+                    price_history = price_window.get_buffer()
+                    mu, sigma = estimate_gbm_parameters(price_history, dt=0.05)
+                    
+                    # 市场状态特征
+                    volatility = price_window.std() / mid_price if mid_price > 0 else 0.0
+                    volume_rate = volume_window.mean()
+                    
+                    # 为每个档位和方向生成特征样本
+                    for side in [True, False]:  # True=bid, False=ask
+                        for level in range(1, lv + 1):
+                            if side:  # bid side
+                                order_price = depth.best_bid - depth.tick_size * level
+                            else:  # ask side  
+                                order_price = depth.best_ask + depth.tick_size * level
+                                
+                            if order_price <= 0:
+                                continue
+                            
+                            # 创建特征向量
+                            feature_vector = np.zeros(25)
+                            feature_vector[:10] = ob_features
+                            feature_vector[10:18] = trade_features
+                            feature_vector[18] = mu
+                            feature_vector[19] = sigma
+                            feature_vector[20] = volatility
+                            feature_vector[21] = volume_rate
+                            feature_vector[22] = float(level)
+                            feature_vector[23] = 1.0 if side else 0.0
+                            feature_vector[24] = order_price / mid_price
+                            
+                            feature_samples.append(feature_vector)
+                            
+                            # 存储元数据用于标签生成
+                            metadata = np.zeros(6)
+                            metadata[0] = current_time
+                            metadata[1] = order_price  
+                            metadata[2] = 1.0 if side else 0.0
+                            metadata[3] = mid_price
+                            metadata[4] = min_h
+                            metadata[5] = max_h
+                            sample_metadata.append(metadata)
+                            
+                            data_points += 1
+                    
+                    # 进度打印（每处理一定数量样本或每5秒）
+                    if (data_points % 1000000 == 0):
+                        print("已收集", data_points, "个特征样本, 当前时间:", current_time)
+                        print("  当前价格: $", mid_price)
+                            
                     hbt.clear_last_trades(asset_no)
                     rec.record(hbt)
-                    continue
+                else:
+                    print("未知返回值:", result)
                 
-                # 记录市场数据
-                mid_price = (depth.best_bid + depth.best_ask) / 2.0
-                market_data.append((current_time, depth.best_bid, depth.best_ask, mid_price))
-                
-                # 计算特征
-                ob_features = calculate_order_book_features(depth, lv)
-                trade_features = calculate_trade_features(trades, current_time)
-                
-                price_window.push(mid_price)
-                volume_window.push(trade_features[1])
-                
-                # 估计GBM参数
-                price_history = price_window.get_buffer()
-                mu, sigma = estimate_gbm_parameters(price_history, dt=0.05)
-                
-                # 市场状态特征
-                volatility = price_window.std() / mid_price if mid_price > 0 else 0.0
-                volume_rate = volume_window.mean()
-                
-                # 为每个档位和方向生成特征样本
-                for side in [True, False]:  # True=bid, False=ask
-                    for level in range(1, lv + 1):
-                        if side:  # bid side
-                            order_price = depth.best_bid - depth.tick_size * level
-                        else:  # ask side  
-                            order_price = depth.best_ask + depth.tick_size * level
-                            
-                        if order_price <= 0:
-                            continue
-                        
-                        # 创建特征向量
-                        feature_vector = np.zeros(25)
-                        feature_vector[:10] = ob_features
-                        feature_vector[10:18] = trade_features
-                        feature_vector[18] = mu
-                        feature_vector[19] = sigma
-                        feature_vector[20] = volatility
-                        feature_vector[21] = volume_rate
-                        feature_vector[22] = float(level)
-                        feature_vector[23] = 1.0 if side else 0.0
-                        feature_vector[24] = order_price / mid_price
-                        
-                        feature_samples.append(feature_vector)
-                        
-                        # 存储元数据用于标签生成
-                        metadata = np.zeros(6)
-                        metadata[0] = current_time
-                        metadata[1] = order_price  
-                        metadata[2] = 1.0 if side else 0.0
-                        metadata[3] = mid_price
-                        metadata[4] = min_h
-                        metadata[5] = max_h
-                        sample_metadata.append(metadata)
-                        
-                        data_points += 1
-                        if data_points % 5_000_000 == 0:
-                            print(f"已收集 {data_points} 个特征样本")
-                            
-                hbt.clear_last_trades(asset_no)
-                rec.record(hbt)
-                
-            print(f"收集完成: {len(market_data)} 个市场数据点, {len(feature_samples)} 个特征样本")
+            print("收集完成:", len(market_data), "个市场数据点,", len(feature_samples), "个特征样本")
             return market_data, feature_samples, sample_metadata
         
         return lambda hbt, rec: _collect_data(hbt, rec, min_horizon, max_horizon, levels)
@@ -370,7 +392,7 @@ class ModelEvaluator:
         plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
-        plt.title('ROC曲线')
+        plt.title('ROC Curve')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -381,7 +403,7 @@ class ModelEvaluator:
             plt.plot(recall, precision, label=model_name)
         plt.xlabel('Recall')
         plt.ylabel('Precision')
-        plt.title('Precision-Recall曲线')
+        plt.title('Precision-Recall Curve')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -393,7 +415,7 @@ class ModelEvaluator:
         plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
         plt.xlabel('Mean Predicted Probability')
         plt.ylabel('Fraction of Positives')
-        plt.title('校准曲线')
+        plt.title('Calibration Curve')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -403,7 +425,7 @@ class ModelEvaluator:
             plt.hist(y_pred, bins=30, alpha=0.5, label=model_name, density=True)
         plt.xlabel('Predicted Probability')
         plt.ylabel('Density')
-        plt.title('预测概率分布')
+        plt.title('Predicted Probability Distribution')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -416,7 +438,7 @@ class ModelEvaluator:
             values = [self.results[name][metric] for name in model_names]
             plt.bar([f"{name}\n{metric}" for name in model_names], values, alpha=0.7)
         plt.xticks(rotation=45)
-        plt.title('指标对比')
+        plt.title('Metrics Comparison')
         plt.grid(True, alpha=0.3)
         
         # 混淆矩阵
@@ -428,7 +450,7 @@ class ModelEvaluator:
         from sklearn.metrics import confusion_matrix
         cm = confusion_matrix(y_true, y_pred_best)
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-        plt.title(f'混淆矩阵 ({best_model})')
+        plt.title(f'Confusion Matrix ({best_model})')
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
         
