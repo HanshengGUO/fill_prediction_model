@@ -54,51 +54,52 @@ from hftbacktest import (
     Recorder
 )
 from hftbacktest.recorder import Recorder_
+from hftbacktest.order import FILLED, PARTIALLY_FILLED
 
 class ForwardLookingDataCollector:
-    """前向查看数据收集器 - 两阶段处理避免时间回退问题"""
+    """前向查看数据收集器 - 事件驱动直接下单标签生成"""
     
-    def __init__(self, min_horizon_ms=100, max_horizon_ms=1000, levels=5):
-        self.min_horizon_ns = min_horizon_ms * 1_000_000  
+    def __init__(self, max_horizon_ms=1000, levels=5, sample_interval=100):
         self.max_horizon_ns = max_horizon_ms * 1_000_000
         self.levels = levels
+        self.sample_interval = sample_interval  # 每多少个事件采样一次
         
     def collect_data_and_labels(self, asset_no: int):
-        """一次性收集特征和标签数据"""
+        """事件驱动直接下单生成特征和标签"""
         
-        min_horizon = self.min_horizon_ns
         max_horizon = self.max_horizon_ns
         levels = self.levels
+        sample_interval = self.sample_interval
         
         @njit
-        def _collect_data(hbt: ROIVectorMarketDepthBacktest, rec: Recorder_,
-                         min_h: int, max_h: int, lv: int):
+        def _collect_data_with_orders(hbt: ROIVectorMarketDepthBacktest, rec: Recorder_,
+                                    max_h: int, lv: int, sample_int: int):
             
-            # 存储市场数据序列
-            market_data = []  # (timestamp, best_bid, best_ask, mid_price)
             feature_samples = []  # 特征样本
-            sample_metadata = []  # 样本元数据用于标签生成
+            labels = []  # 标签
             
             # 市场状态窗口
             price_window = MW(200)
             volume_window = MW(100)
             
+            event_count = 0
             data_points = 0
+            next_order_id = 1000  # 起始订单ID
             
-            print("第一阶段：收集市场数据和特征（事件驱动模式）...")
+            print("事件驱动采样模式：每", sample_int, "个事件采样一次")
             
             while True:
                 # 等待下一个市场数据事件
                 result = hbt.wait_next_feed(
                     include_order_resp=False,
-                    timeout=10000000000  # 10秒超时
+                    timeout=100_000_000_000_000
                 )
                 
                 current_time = hbt.current_timestamp
-
+                
                 # 检查结果
                 if result == 0:  # 超时
-                    if data_points == 0:
+                    if event_count == 0:
                         print("警告: 没有收到任何事件，可能数据有问题")
                         break
                     continue
@@ -111,13 +112,20 @@ class ForwardLookingDataCollector:
                     
                     # 检查订单簿数据有效性
                     if depth.best_bid <= 0 or depth.best_ask <= 0:
-                        hbt.clear_last_trades(asset_no)
-                        rec.record(hbt)
+                        # hbt.clear_last_trades(asset_no)
+                        # rec.record(hbt)
                         continue
                     
-                    # 记录市场数据
+                    event_count += 1
+                    
+                    # 每sample_interval个事件采样一次
+                    if event_count % sample_int != 0:
+                        # hbt.clear_last_trades(asset_no)
+                        # rec.record(hbt)
+                        continue
+                    
+                    # 进行采样：计算特征并下单
                     mid_price = (depth.best_bid + depth.best_ask) / 2.0
-                    market_data.append((current_time, depth.best_bid, depth.best_ask, mid_price))
                     
                     # 计算特征
                     ob_features = calculate_order_book_features(depth, lv)
@@ -134,16 +142,16 @@ class ForwardLookingDataCollector:
                     volatility = price_window.std() / mid_price if mid_price > 0 else 0.0
                     volume_rate = volume_window.mean()
                     
-                    # 为每个档位和方向生成特征样本
-                    for side in [True, False]:  # True=bid, False=ask
-                        for level in range(1, lv + 1):
-                            if side:  # bid side
-                                order_price = depth.best_bid - depth.tick_size * level
-                            else:  # ask side  
-                                order_price = depth.best_ask + depth.tick_size * level
-                                
-                            if order_price <= 0:
-                                continue
+                    # 存储当前订单ID，用于后续检查
+                    order_ids = []
+                    
+                    # 为bid side的前几档价格下买单（价格 <= best_bid）
+                    for level in range(lv):
+                        # 买单：在bid side下单，价格比best_bid低
+                        order_price = depth.best_bid - depth.tick_size * level
+                        if order_price > 0:
+                            hbt.submit_buy_order(asset_no, next_order_id, order_price, 1.0, 
+                                               False, False, False)
                             
                             # 创建特征向量
                             feature_vector = np.zeros(25)
@@ -153,87 +161,74 @@ class ForwardLookingDataCollector:
                             feature_vector[19] = sigma
                             feature_vector[20] = volatility
                             feature_vector[21] = volume_rate
-                            feature_vector[22] = float(level)
-                            feature_vector[23] = 1.0 if side else 0.0
+                            feature_vector[22] = float(level + 1)  # 档位从1开始
+                            feature_vector[23] = 1.0  # buy side
                             feature_vector[24] = order_price / mid_price
                             
                             feature_samples.append(feature_vector)
-                            
-                            # 存储元数据用于标签生成
-                            metadata = np.zeros(6)
-                            metadata[0] = current_time
-                            metadata[1] = order_price  
-                            metadata[2] = 1.0 if side else 0.0
-                            metadata[3] = mid_price
-                            metadata[4] = min_h
-                            metadata[5] = max_h
-                            sample_metadata.append(metadata)
-                            
-                            data_points += 1
+                            order_ids.append(next_order_id)
+                            next_order_id += 1
                     
-                    # 进度打印（每处理一定数量样本或每5秒）
-                    if (data_points % 1000000 == 0):
-                        print("已收集", data_points, "个特征样本, 当前时间:", current_time)
+                    # 为ask side的前几档价格下卖单（价格 >= best_ask）
+                    for level in range(lv):
+                        # 卖单：在ask side下单，价格比best_ask高
+                        order_price = depth.best_ask + depth.tick_size * level
+                        hbt.submit_sell_order(asset_no, next_order_id, order_price, 1.0,
+                                            False, False, False)
+                        
+                        # 创建特征向量
+                        feature_vector = np.zeros(25)
+                        feature_vector[:10] = ob_features
+                        feature_vector[10:18] = trade_features
+                        feature_vector[18] = mu
+                        feature_vector[19] = sigma
+                        feature_vector[20] = volatility
+                        feature_vector[21] = volume_rate
+                        feature_vector[22] = float(level + 1)  # 档位从1开始
+                        feature_vector[23] = 0.0  # sell side
+                        feature_vector[24] = order_price / mid_price
+                        
+                        feature_samples.append(feature_vector)
+                        order_ids.append(next_order_id)
+                        next_order_id += 1
+                    
+                    # 等待max_horizon时间
+                    hbt.elapse(max_h)
+                    
+                    # 检查订单成交情况并生成标签（使用用户提供的方法）
+                    for i, order_id in enumerate(order_ids):
+                        orders = hbt.orders(asset_no)
+                        order = orders.get(order_id)
+                        
+                        if order is None:
+                            # 订单不存在，假设是已成交
+                            print(f"订单 {order_id} 不存在，假设是已成交")
+                            labels.append(1.0)
+                        elif order.status == FILLED or order.status == PARTIALLY_FILLED:
+                            # 明确已成交
+                            labels.append(1.0)
+                        else:
+                            # 订单仍存在且未成交
+                            labels.append(0.0)
+                            # 取消这些未成交的测试订单
+                            hbt.cancel(asset_no, order_id, False)
+
+                    data_points += len(order_ids)
+                    
+                    # 进度打印
+                    if (data_points % 50000 == 0):
+                        print("已处理", data_points, "个样本, 事件:", event_count, ", 当前时间:", current_time)
                         print("  当前价格: $", mid_price)
-                            
-                    hbt.clear_last_trades(asset_no)
-                    rec.record(hbt)
+                        
+                    # hbt.clear_last_trades(asset_no)
+                    # rec.record(hbt)
                 else:
                     print("未知返回值:", result)
                 
-            print("收集完成:", len(market_data), "个市场数据点,", len(feature_samples), "个特征样本")
-            return market_data, feature_samples, sample_metadata
+            print("收集完成:", len(feature_samples), "个特征样本,", len(labels), "个标签")
+            return feature_samples, labels
         
-        return lambda hbt, rec: _collect_data(hbt, rec, min_horizon, max_horizon, levels)
-
-    def generate_labels_from_market_data(self, market_data, sample_metadata):
-        """基于收集的市场数据生成forward looking标签"""
-        print("第二阶段：生成forward looking标签...")
-        
-        # 转换为numpy数组以便快速查找
-        market_data_array = np.array(market_data)
-        timestamps = market_data_array[:, 0]
-        bids = market_data_array[:, 1] 
-        asks = market_data_array[:, 2]
-        
-        labels = []
-        total_samples = len(sample_metadata)
-        
-        for i, meta in enumerate(sample_metadata):
-            timestamp = meta[0]
-            order_price = meta[1]
-            is_bid = bool(meta[2])
-            min_horizon = meta[4]
-            max_horizon = meta[5]
-            
-            # 设置时间窗口
-            start_time = timestamp + min_horizon
-            end_time = timestamp + max_horizon
-            
-            # 找到时间窗口内的数据索引
-            window_mask = (timestamps >= start_time) & (timestamps <= end_time)
-            window_indices = np.where(window_mask)[0]
-            
-            label = 0.0
-            
-            if len(window_indices) > 0:
-                if is_bid:
-                    # 对于bid订单，检查ask价格是否触及我们的order_price
-                    window_asks = asks[window_indices]
-                    if np.any(window_asks <= order_price):
-                        label = 1.0
-                else:
-                    # 对于ask订单，检查bid价格是否触及我们的order_price
-                    window_bids = bids[window_indices]
-                    if np.any(window_bids >= order_price):
-                        label = 1.0
-            
-            labels.append(label)
-            
-            if (i + 1) % 100000 == 0:
-                print(f"已处理 {i+1}/{total_samples} 个标签 ({(i+1)/total_samples*100:.1f}%)")
-                
-        return np.array(labels)
+        return lambda hbt, rec: _collect_data_with_orders(hbt, rec, max_horizon, levels, sample_interval)
 
 class ModelTrainer:
     """多模型训练器"""
@@ -459,10 +454,10 @@ class ModelEvaluator:
             plt.savefig(f"{save_path}_evaluation.png", dpi=300, bbox_inches='tight')
         plt.show()
 
-def run_execution_probability_prediction(min_horizon_ms=100, max_horizon_ms=1000):
+def run_execution_probability_prediction(max_horizon_ms=1000):
     """运行完整的执行概率预测流程"""
     
-    print(f"开始执行概率预测 - 时间范围: {min_horizon_ms}ms - {max_horizon_ms}ms")
+    print(f"开始执行概率预测 - 时间范围: 0ms - {max_horizon_ms}ms")
     
     # 1. 数据收集
     print("\n第一步：收集数据")
@@ -492,90 +487,84 @@ def run_execution_probability_prediction(min_horizon_ms=100, max_horizon_ms=1000
     hbt = ROIVectorMarketDepthBacktest([asset])
     recorder = Recorder(1, 5_000_000)
 
-    # 收集特征数据
+    # 收集特征数据和标签（一步完成）
     collector = ForwardLookingDataCollector(
-        min_horizon_ms=min_horizon_ms, 
         max_horizon_ms=max_horizon_ms, 
-        levels=5
+        levels=5,
+        sample_interval=50  # 每50个事件采样一次
     )
     
     collect_task = collector.collect_data_and_labels(0)
-    market_data, features_list, metadata_list = collect_task(hbt, recorder.recorder)
+    features_list, labels = collect_task(hbt, recorder.recorder)
     
     print(f"收集到 {len(features_list)} 个样本")
-    
-    # 2. 生成forward looking标签
-    print("\n第二步：生成标签")
-    
-    labels = collector.generate_labels_from_market_data(market_data, metadata_list)
     
     hbt.close()
     
     # 转换为numpy数组
     X = np.array(features_list)
-    y = labels
+    y = np.array(labels)
     
     print(f"特征维度: {X.shape}")
     print(f"正样本比例: {np.mean(y):.3f}")
     
-    # 3. 数据分割
-    print("\n第三步：分割数据")
+    # # 2. 数据分割
+    # print("\n第二步：分割数据")
     
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # X_train, X_test, y_train, y_test = train_test_split(
+    #     X, y, test_size=0.2, random_state=42, stratify=y
+    # )
     
-    print(f"训练集大小: {len(X_train)}")
-    print(f"测试集大小: {len(X_test)}")
+    # print(f"训练集大小: {len(X_train)}")
+    # print(f"测试集大小: {len(X_test)}")
     
-    # 4. 模型训练
-    print("\n第四步：训练模型")
+    # # 3. 模型训练
+    # print("\n第三步：训练模型")
     
-    trainer = ModelTrainer()
-    trainer.train_all_models(X_train, y_train)
+    # trainer = ModelTrainer()
+    # trainer.train_all_models(X_train, y_train)
     
-    # 5. 模型预测
-    print("\n第五步：模型预测")
+    # # 4. 模型预测
+    # print("\n第四步：模型预测")
     
-    predictions = trainer.predict_all_models(X_test)
+    # predictions = trainer.predict_all_models(X_test)
     
-    # 6. 模型评估
-    print("\n第六步：模型评估")
+    # # 5. 模型评估
+    # print("\n第五步：模型评估")
     
-    evaluator = ModelEvaluator()
-    evaluator.evaluate_all_models(y_test, predictions)
+    # evaluator = ModelEvaluator()
+    # evaluator.evaluate_all_models(y_test, predictions)
     
-    # 7. 可视化结果
-    print("\n第七步：生成评估图表")
+    # # 6. 可视化结果
+    # print("\n第六步：生成评估图表")
     
-    evaluator.plot_evaluation_results(
-        y_test, predictions, 
-        save_path=f"execution_prediction_{min_horizon_ms}ms_{max_horizon_ms}ms"
-    )
+    # evaluator.plot_evaluation_results(
+    #     y_test, predictions, 
+    #     save_path=f"execution_prediction_0ms_{max_horizon_ms}ms"
+    # )
     
-    # 8. 保存结果
-    print("\n第八步：保存结果")
+    # # 7. 保存结果
+    # print("\n第七步：保存结果")
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 保存模型
-    with open(f"models_{min_horizon_ms}ms_{max_horizon_ms}ms_{timestamp}.pkl", 'wb') as f:
-        pickle.dump(trainer.models, f)
+    # # 保存模型
+    # with open(f"models_0ms_{max_horizon_ms}ms_{timestamp}.pkl", 'wb') as f:
+    #     pickle.dump(trainer.models, f)
     
-    # 保存评估结果
-    results_df = pd.DataFrame(evaluator.results).T
-    results_df.to_csv(f"evaluation_results_{min_horizon_ms}ms_{max_horizon_ms}ms_{timestamp}.csv")
+    # # 保存评估结果
+    # results_df = pd.DataFrame(evaluator.results).T
+    # results_df.to_csv(f"evaluation_results_0ms_{max_horizon_ms}ms_{timestamp}.csv")
     
-    print(f"结果已保存")
-    print(f"最佳模型: {max(evaluator.results.keys(), key=lambda x: evaluator.results[x]['roc_auc'])}")
+    # print(f"结果已保存")
+    # print(f"最佳模型: {max(evaluator.results.keys(), key=lambda x: evaluator.results[x]['roc_auc'])}")
     
-    return trainer, evaluator, predictions
+    # return trainer, evaluator, predictions
 
 if __name__ == "__main__":
     # 运行预测任务
-    trainer, evaluator, predictions = run_execution_probability_prediction(
-        min_horizon_ms=0,   # 100ms最小时间
-        max_horizon_ms=8000   # 1000ms最大时间
+    run_execution_probability_prediction(
+        max_horizon_ms=1000000
     )
     
     print("\n任务完成！")
