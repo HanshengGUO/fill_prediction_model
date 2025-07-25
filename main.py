@@ -58,7 +58,7 @@ from hftbacktest.recorder import Recorder_
 class ForwardLookingDataCollector:
     """前向查看数据收集器 - 两阶段处理避免时间回退问题"""
     
-    def __init__(self, min_horizon_ms=0, max_horizon_ms=1000, levels=5):
+    def __init__(self, min_horizon_ms=100, max_horizon_ms=1000, levels=5):
         self.min_horizon_ns = min_horizon_ms * 1_000_000  
         self.max_horizon_ns = max_horizon_ms * 1_000_000
         self.levels = levels
@@ -84,7 +84,7 @@ class ForwardLookingDataCollector:
             volume_window = MW(100)
             
             data_points = 0
-            sample_interval = 50_000_000  # 50ms采样间隔
+            sample_interval = 500_000_000  # 50ms采样间隔
             
             print("第一阶段：收集市场数据和特征...")
             
@@ -553,7 +553,7 @@ if __name__ == "__main__":
     # 运行预测任务
     trainer, evaluator, predictions = run_execution_probability_prediction(
         min_horizon_ms=0,   # 100ms最小时间
-        max_horizon_ms=1000   # 1000ms最大时间
+        max_horizon_ms=8000   # 1000ms最大时间
     )
     
     print("\n任务完成！")
