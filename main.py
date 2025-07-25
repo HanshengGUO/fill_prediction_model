@@ -1,34 +1,42 @@
 import numpy as np
 import pandas as pd
-from numba import njit, float64, int32
-from numba.typed import List
-from sklearn.model_selection import train_test_split
+from numba import njit, float64, int32, boolean, types
+from numba.typed import List, Dict
+from numba.experimental import jitclass
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, roc_curve
-from sklearn.calibration import calibration_curve, CalibrationDisplay
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, 
+                           roc_auc_score, roc_curve, precision_recall_curve, brier_score_loss, 
+                           log_loss, classification_report)
+from sklearn.model_selection import train_test_split
+from sklearn.calibration import calibration_curve
 import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle
 from datetime import datetime
-import warnings
+
+# 导入现有的工具函数和类
+from gbm_model_training_evaluation import (
+    MW, estimate_gbm_parameters, 
+    calculate_execution_probability_gbm, calculate_order_book_features, 
+    calculate_trade_features
+)
 
 try:
     import lightgbm as lgb
-
-    LGB_AVAILABLE = True
+    LIGHTGBM_AVAILABLE = True
     print("✓ LightGBM可用")
 except ImportError:
-    LGB_AVAILABLE = False
-    print("✗ LightGBM不可用 - 请运行 'pip install lightgbm'")
+    LIGHTGBM_AVAILABLE = False
+    print("✗ LightGBM不可用")
 
 try:
     import catboost as cb
-
-    CAT_AVAILABLE = True
+    CATBOOST_AVAILABLE = True
     print("✓ CatBoost可用")
 except ImportError:
-    CAT_AVAILABLE = False
-    print("✗ CatBoost不可用 - 请运行 'pip install catboost'")
-
-warnings.filterwarnings("ignore", category=UserWarning, module='catboost')
+    CATBOOST_AVAILABLE = False
+    print("✗ CatBoost不可用")
 
 from hftbacktest import (
     BacktestAsset,
@@ -45,364 +53,507 @@ from hftbacktest import (
     DEPTH_EVENT,
     Recorder
 )
+from hftbacktest.recorder import Recorder_
 
-
-@njit
-def estimate_gbm_parameters(price_history, dt=1.0):
-    if len(price_history) < 2: return 0.0, 0.01
-    log_returns = np.log(price_history[1:] / price_history[:-1])
-    if len(log_returns) == 0: return 0.0, 0.01
-    mean_log_return = np.mean(log_returns)
-    std_log_return = np.std(log_returns)
-    volatility = std_log_return / np.sqrt(dt)
-    drift = mean_log_return / dt + 0.5 * volatility * volatility
-    return drift, max(volatility, 1e-6)
-
-
-@njit
-def calculate_execution_probability_gbm(order_price, current_price, side, mu, sigma, time_horizon):
-    if sigma <= 1e-7 or current_price <= 0 or order_price <= 0: return 0.5
-    price_ratio = order_price / current_price
-    log_ratio = np.log(price_ratio)
-    adjusted_drift = mu - 0.5 * sigma * sigma
-    d1 = (log_ratio - adjusted_drift * time_horizon) / (sigma * np.sqrt(time_horizon))
-    if side:
-        prob = 0.5 * (1 - np.tanh(d1 / np.sqrt(2)))
-    else:
-        prob = 0.5 * (1 + np.tanh(d1 / np.sqrt(2)))
-    return min(max(prob, 0.0), 1.0)
-
-
-@njit
-def calculate_order_book_features(depth, levels=5):
-    features = np.zeros(10)
-    if depth.best_bid <= 0 or depth.best_ask <= 0: return features
-    best_bid, best_ask = depth.best_bid, depth.best_ask
-    mid_price = (best_bid + best_ask) / 2.0
-    features[0] = mid_price
-    features[1] = best_ask - best_bid
-    features[2] = features[1] / mid_price * 10000
-    total_bid_qty, total_ask_qty = 0.0, 0.0
-    for i in range(levels):
-        total_bid_qty += depth.bid_qty_at_tick(depth.best_bid_tick - i)
-        total_ask_qty += depth.ask_qty_at_tick(depth.best_ask_tick + i)
-    features[3], features[4] = total_bid_qty, total_ask_qty
-    if total_bid_qty + total_ask_qty > 0:
-        features[5] = (total_bid_qty - total_ask_qty) / (total_bid_qty + total_ask_qty)
-    best_bid_qty = depth.bid_qty_at_tick(depth.best_bid_tick)
-    best_ask_qty = depth.ask_qty_at_tick(depth.best_ask_tick)
-    if best_bid_qty + best_ask_qty > 0:
-        features[9] = (best_bid_qty - best_ask_qty) / (best_bid_qty + best_ask_qty)
-    return features
-
-
-@njit
-def calculate_trade_features(trades, current_time, time_window=5_000_000_000):
-    features = np.zeros(8)
-    if len(trades) == 0: return features
-    total_volume, buy_volume, sell_volume, recent_trades = 0.0, 0.0, 0.0, 0
-    for trade in trades:
-        if current_time - trade.local_ts <= time_window:
-            recent_trades += 1
-            total_volume += trade.qty
-            if trade.ev & BUY_EVENT:
-                buy_volume += trade.qty
-            else:
-                sell_volume += trade.qty
-    features[0] = float(recent_trades)
-    features[1] = total_volume
-    features[2] = buy_volume
-    features[3] = sell_volume
-    if total_volume > 0:
-        features[4] = (buy_volume - sell_volume) / total_volume
-    return features
-
-
-@njit
-def generate_label_njit(
-        order_price: float,
-        side_is_buy: bool,
-        current_time: int,
-        min_time_horizon: int,
-        max_time_horizon: int,
-        future_trade_ts: np.ndarray,
-        future_trade_px: np.ndarray
-):
-    start_idx = np.searchsorted(future_trade_ts, current_time + min_time_horizon, side='right')
-    end_idx = np.searchsorted(future_trade_ts, current_time + max_time_horizon, side='right')
-
-    label = 0
-    if start_idx < len(future_trade_ts):
-        future_slice_len = end_idx - start_idx
-        if future_slice_len > 0:
-            future_prices = future_trade_px[start_idx:end_idx]
-            if side_is_buy:
-                if np.any(future_prices <= order_price):
-                    label = 1
-            else:
-                if np.any(future_prices >= order_price):
-                    label = 1
-    return float(label)
-
-
-class SupervisedDataCollector:
-    def __init__(self, time_horizon_seconds=1.0, levels=5, sample_interval_ms=100, warmup_seconds=10):
-        self.time_horizon = int(time_horizon_seconds * 1_000_000_000)
-        self.min_time_horizon = int(0.1 * 1_000_000_000)
+class ForwardLookingDataCollector:
+    """前向查看数据收集器 - 两阶段处理避免时间回退问题"""
+    
+    def __init__(self, min_horizon_ms=0, max_horizon_ms=1000, levels=5):
+        self.min_horizon_ns = min_horizon_ms * 1_000_000  
+        self.max_horizon_ns = max_horizon_ms * 1_000_000
         self.levels = levels
-        self.sample_interval = int(sample_interval_ms * 1_000_000)
-        self.warmup_period = int(warmup_seconds * 1_000_000_000)
-
-    def collect(self, hbt: ROIVectorMarketDepthBacktest, asset_no: int, full_data: np.ndarray):
-        print("开始收集监督学习数据...")
-
-        print("正在从预加载的数据中提取未来成交信息...")
-        trade_mask = (full_data['ev'] & TRADE_EVENT) == TRADE_EVENT
-        future_trade_ts = full_data['local_ts'][trade_mask]
-        future_trade_px = full_data['px'][trade_mask]
-
-        features_list = []
-        labels_list = []
-
-        print(f"正在预热回测引擎 ({self.warmup_period / 1e9} 秒)...")
-        if hbt.elapse(self.warmup_period) != 0:
-            print("警告: 预热期间已到达数据末尾。")
-            return np.array(features_list), np.array(labels_list)
-        print("预热完成。")
-
-        price_window = np.zeros(200)
-        price_idx = 0
-        data_points = 0
-        last_print_time = hbt.current_timestamp
-
-        while hbt.elapse(self.sample_interval) == 0:
-            current_time = hbt.current_timestamp
-            depth = hbt.depth(asset_no)
-            trades = hbt.last_trades(asset_no)
-
-            if depth.best_bid <= 0 or depth.best_ask <= 0:
+        
+    def collect_data_and_labels(self, asset_no: int):
+        """一次性收集特征和标签数据"""
+        
+        min_horizon = self.min_horizon_ns
+        max_horizon = self.max_horizon_ns
+        levels = self.levels
+        
+        @njit
+        def _collect_data(hbt: ROIVectorMarketDepthBacktest, rec: Recorder_,
+                         min_h: int, max_h: int, lv: int):
+            
+            # 存储市场数据序列
+            market_data = []  # (timestamp, best_bid, best_ask, mid_price)
+            feature_samples = []  # 特征样本
+            sample_metadata = []  # 样本元数据用于标签生成
+            
+            # 市场状态窗口
+            price_window = MW(200)
+            volume_window = MW(100)
+            
+            data_points = 0
+            sample_interval = 50_000_000  # 50ms采样间隔
+            
+            print("第一阶段：收集市场数据和特征...")
+            
+            while hbt.elapse(sample_interval) == 0:
+                current_time = hbt.current_timestamp
+                depth = hbt.depth(asset_no)
+                trades = hbt.last_trades(asset_no)
+                
+                if depth.best_bid <= 0 or depth.best_ask <= 0:
+                    hbt.clear_last_trades(asset_no)
+                    rec.record(hbt)
+                    continue
+                
+                # 记录市场数据
+                mid_price = (depth.best_bid + depth.best_ask) / 2.0
+                market_data.append((current_time, depth.best_bid, depth.best_ask, mid_price))
+                
+                # 计算特征
+                ob_features = calculate_order_book_features(depth, lv)
+                trade_features = calculate_trade_features(trades, current_time)
+                
+                price_window.push(mid_price)
+                volume_window.push(trade_features[1])
+                
+                # 估计GBM参数
+                price_history = price_window.get_buffer()
+                mu, sigma = estimate_gbm_parameters(price_history, dt=0.05)
+                
+                # 市场状态特征
+                volatility = price_window.std() / mid_price if mid_price > 0 else 0.0
+                volume_rate = volume_window.mean()
+                
+                # 为每个档位和方向生成特征样本
+                for side in [True, False]:  # True=bid, False=ask
+                    for level in range(1, lv + 1):
+                        if side:  # bid side
+                            order_price = depth.best_bid - depth.tick_size * level
+                        else:  # ask side  
+                            order_price = depth.best_ask + depth.tick_size * level
+                            
+                        if order_price <= 0:
+                            continue
+                        
+                        # 创建特征向量
+                        feature_vector = np.zeros(25)
+                        feature_vector[:10] = ob_features
+                        feature_vector[10:18] = trade_features
+                        feature_vector[18] = mu
+                        feature_vector[19] = sigma
+                        feature_vector[20] = volatility
+                        feature_vector[21] = volume_rate
+                        feature_vector[22] = float(level)
+                        feature_vector[23] = 1.0 if side else 0.0
+                        feature_vector[24] = order_price / mid_price
+                        
+                        feature_samples.append(feature_vector)
+                        
+                        # 存储元数据用于标签生成
+                        metadata = np.zeros(6)
+                        metadata[0] = current_time
+                        metadata[1] = order_price  
+                        metadata[2] = 1.0 if side else 0.0
+                        metadata[3] = mid_price
+                        metadata[4] = min_h
+                        metadata[5] = max_h
+                        sample_metadata.append(metadata)
+                        
+                        data_points += 1
+                        if data_points % 5_000_000 == 0:
+                            print(f"已收集 {data_points} 个特征样本")
+                            
                 hbt.clear_last_trades(asset_no)
-                continue
+                rec.record(hbt)
+                
+            print(f"收集完成: {len(market_data)} 个市场数据点, {len(feature_samples)} 个特征样本")
+            return market_data, feature_samples, sample_metadata
+        
+        return lambda hbt, rec: _collect_data(hbt, rec, min_horizon, max_horizon, levels)
 
-            if current_time - last_print_time > 5_000_000_000:
-                print(f"  ...已处理到时间: {current_time}, 已收集样本: {data_points}")
-                last_print_time = current_time
+    def generate_labels_from_market_data(self, market_data, sample_metadata):
+        """基于收集的市场数据生成forward looking标签"""
+        print("第二阶段：生成forward looking标签...")
+        
+        # 转换为numpy数组以便快速查找
+        market_data_array = np.array(market_data)
+        timestamps = market_data_array[:, 0]
+        bids = market_data_array[:, 1] 
+        asks = market_data_array[:, 2]
+        
+        labels = []
+        total_samples = len(sample_metadata)
+        
+        for i, meta in enumerate(sample_metadata):
+            timestamp = meta[0]
+            order_price = meta[1]
+            is_bid = bool(meta[2])
+            min_horizon = meta[4]
+            max_horizon = meta[5]
+            
+            # 设置时间窗口
+            start_time = timestamp + min_horizon
+            end_time = timestamp + max_horizon
+            
+            # 找到时间窗口内的数据索引
+            window_mask = (timestamps >= start_time) & (timestamps <= end_time)
+            window_indices = np.where(window_mask)[0]
+            
+            label = 0.0
+            
+            if len(window_indices) > 0:
+                if is_bid:
+                    # 对于bid订单，检查ask价格是否触及我们的order_price
+                    window_asks = asks[window_indices]
+                    if np.any(window_asks <= order_price):
+                        label = 1.0
+                else:
+                    # 对于ask订单，检查bid价格是否触及我们的order_price
+                    window_bids = bids[window_indices]
+                    if np.any(window_bids >= order_price):
+                        label = 1.0
+            
+            labels.append(label)
+            
+            if (i + 1) % 100000 == 0:
+                print(f"已处理 {i+1}/{total_samples} 个标签 ({(i+1)/total_samples*100:.1f}%)")
+                
+        return np.array(labels)
 
-            ob_features = calculate_order_book_features(depth, self.levels)
-            trade_features = calculate_trade_features(trades, current_time)
-            mid_price = ob_features[0]
-
-            price_window[price_idx] = mid_price
-            price_idx = (price_idx + 1) % len(price_window)
-            mu, sigma = estimate_gbm_parameters(price_window, dt=0.1)
-
-            for side_is_buy in [True, False]:
-                for level in range(self.levels):
-                    if side_is_buy:
-                        order_price = depth.best_bid - depth.tick_size * level
-                    else:
-                        order_price = depth.best_ask + depth.tick_size * level
-
-                    if order_price <= 0: continue
-
-                    feature_vector = np.zeros(23)
-                    feature_vector[:10] = ob_features
-                    feature_vector[10:18] = trade_features
-                    feature_vector[18] = mu
-                    feature_vector[19] = sigma
-                    feature_vector[20] = float(level)
-                    feature_vector[21] = 1.0 if side_is_buy else 0.0
-                    feature_vector[22] = order_price / mid_price if mid_price > 0 else 1.0
-
-                    label = generate_label_njit(
-                        order_price,
-                        side_is_buy,
-                        current_time,
-                        self.min_time_horizon,
-                        self.time_horizon,
-                        future_trade_ts,
-                        future_trade_px
-                    )
-
-                    features_list.append(feature_vector)
-                    labels_list.append(label)
-                    data_points += 1
-
-            hbt.clear_last_trades(asset_no)
-
-        print(f"\n数据收集完成。总共收集到 {len(features_list)} 个样本。")
-        return np.array(features_list), np.array(labels_list)
-
-
-class ModelBenchmarker:
-    def __init__(self, models_to_test, random_state=42):
-        self.models = models_to_test
-        self.random_state = random_state
-        self.results = {}
-
-    def run(self, X, y, data_name="Execution"):
-        print(f"\n{'=' * 25} 开始对 {data_name} 数据进行基准测试 {'=' * 25}")
-        if len(np.unique(y)) < 2:
-            print(f"警告: {data_name} 数据只有一个类别 ({np.unique(y)}), 无法进行有意义的训练和评估。跳过。")
-            return None
-
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.3, random_state=self.random_state, stratify=y
+class ModelTrainer:
+    """多模型训练器"""
+    
+    def __init__(self):
+        self.models = {}
+        self.model_names = ['GBM_Baseline', 'Logistic', 'RandomForest']
+        
+        if LIGHTGBM_AVAILABLE:
+            self.model_names.append('LightGBM')
+        if CATBOOST_AVAILABLE:
+            self.model_names.append('CatBoost')
+    
+    def create_models(self):
+        """创建所有模型"""
+        
+        # GBM Baseline (使用理论GBM概率作为特征的逻辑回归)
+        self.models['GBM_Baseline'] = LogisticRegression(
+            random_state=42, max_iter=1000
         )
-        print(f"训练集大小: {len(X_train)}, 验证集大小: {len(X_val)}")
-        print(f"成交率 (训练集): {y_train.mean():.2%}, (验证集): {y_val.mean():.2%}")
+        
+        # 逻辑回归
+        self.models['Logistic'] = LogisticRegression(
+            random_state=42, max_iter=1000, C=1.0
+        )
+        
+        # 随机森林
+        self.models['RandomForest'] = RandomForestClassifier(
+            n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
+        )
+        
+        # LightGBM
+        if LIGHTGBM_AVAILABLE:
+            self.models['LightGBM'] = lgb.LGBMClassifier(
+                n_estimators=100,
+                max_depth=10,
+                learning_rate=0.1,
+                random_state=42,
+                verbose=-1
+            )
+        
+        # CatBoost
+        if CATBOOST_AVAILABLE:
+            self.models['CatBoost'] = cb.CatBoostClassifier(
+                iterations=100,
+                depth=10,
+                learning_rate=0.1,
+                random_seed=42,
+                verbose=False
+            )
+    
+    def train_all_models(self, X_train, y_train):
+        """训练所有模型"""
+        print("开始训练所有模型...")
+        
+        self.create_models()
+        
+        for name in self.model_names:
+            print(f"训练 {name} 模型...")
+            
+            if name == 'GBM_Baseline':
+                # 为GBM baseline添加理论概率特征
+                X_train_gbm = self.add_gbm_features(X_train)
+                self.models[name].fit(X_train_gbm, y_train)
+            else:
+                self.models[name].fit(X_train, y_train)
+    
+    def add_gbm_features(self, X):
+        """为GBM baseline添加理论概率特征"""
+        X_enhanced = np.column_stack([X, np.zeros(len(X))])
+        
+        for i in range(len(X)):
+            # 提取相关特征
+            mid_price = X[i, 0]
+            mu = X[i, 18]
+            sigma = X[i, 19]
+            is_bid = bool(X[i, 23])
+            order_price = X[i, 24] * mid_price
+            
+            # 计算理论GBM概率作为额外特征
+            gbm_prob = calculate_execution_probability_gbm(
+                order_price, mid_price, is_bid, mu, sigma, 0.5  # 500ms
+            )
+            X_enhanced[i, -1] = gbm_prob
+            
+        return X_enhanced
+    
+    def predict_all_models(self, X_test):
+        """所有模型预测"""
+        predictions = {}
+        
+        for name in self.model_names:
+            if name == 'GBM_Baseline':
+                X_test_gbm = self.add_gbm_features(X_test)
+                predictions[name] = self.models[name].predict_proba(X_test_gbm)[:, 1]
+            else:
+                predictions[name] = self.models[name].predict_proba(X_test)[:, 1]
+                
+        return predictions
 
-        print("\n--- 正在评估 Baseline: GBM理论模型 ---")
-        gbm_probs = self._get_gbm_predictions(X_val)
-        self.results['GBM (Baseline)'] = self._evaluate_predictions(y_val, gbm_probs)
-
-        for name, model in self.models.items():
-            print(f"\n--- 正在训练和评估: {name} ---")
-            model.fit(X_train, y_train)
-            y_pred_proba = model.predict_proba(X_val)[:, 1]
-            self.results[name] = self._evaluate_predictions(y_val, y_pred_proba)
-            self.models[name] = model
-
-        self._print_results()
-        self._plot_results(X_val, y_val)
-
-        print(f"{'=' * 25} {data_name} 数据基准测试完成 {'=' * 25}\n")
-        return self.results
-
-    def _get_gbm_predictions(self, X_val):
-        mu = X_val[:, 18]
-        sigma = X_val[:, 19]
-        side = X_val[:, 21].astype(bool)
-        relative_price = X_val[:, 22]
-        time_horizon = 0.5
-        probs = np.array([
-            calculate_execution_probability_gbm(relative_price[i], 1.0, side[i], mu[i], sigma[i], time_horizon)
-            for i in range(len(X_val))
-        ])
-        return probs
-
-    def _evaluate_predictions(self, y_true, y_pred_proba):
-        return {
-            'ROC AUC': roc_auc_score(y_true, y_pred_proba),
-            'Brier Score': brier_score_loss(y_true, y_pred_proba),
-            'Log Loss': log_loss(y_true, y_pred_proba)
+class ModelEvaluator:
+    """全面的模型评估器"""
+    
+    def __init__(self):
+        self.results = {}
+    
+    def evaluate_all_models(self, y_true, predictions):
+        """评估所有模型"""
+        print("\n" + "="*60)
+        print("模型评估结果")
+        print("="*60)
+        
+        for model_name, y_pred in predictions.items():
+            print(f"\n{model_name} 模型:")
+            print("-" * 40)
+            
+            results = self.calculate_metrics(y_true, y_pred)
+            self.results[model_name] = results
+            
+            print(f"ROC AUC: {results['roc_auc']:.4f}")
+            print(f"Brier Score: {results['brier_score']:.4f}")
+            print(f"Log Loss: {results['log_loss']:.4f}")
+            print(f"准确率: {results['accuracy']:.4f}")
+            print(f"精确率: {results['precision']:.4f}")
+            print(f"召回率: {results['recall']:.4f}")
+            print(f"F1分数: {results['f1_score']:.4f}")
+    
+    def calculate_metrics(self, y_true, y_pred_proba):
+        """计算全面的评估指标"""
+        y_pred = (y_pred_proba > 0.5).astype(int)
+        
+        results = {
+            'roc_auc': roc_auc_score(y_true, y_pred_proba),
+            'brier_score': brier_score_loss(y_true, y_pred_proba),
+            'log_loss': log_loss(y_true, y_pred_proba),
+            'accuracy': accuracy_score(y_true, y_pred),
+            'precision': precision_score(y_true, y_pred, zero_division=0),
+            'recall': recall_score(y_true, y_pred, zero_division=0),
+            'f1_score': f1_score(y_true, y_pred, zero_division=0)
         }
-
-    def _print_results(self):
-        results_df = pd.DataFrame(self.results).T
-        results_df = results_df.sort_values(by='Brier Score', ascending=True)
-        print("\n--- 模型评估结果对比 ---")
-        print("(Brier Score 和 Log Loss 越低越好, ROC AUC 越高越好)")
-        print(results_df)
-
-    def _plot_results(self, X_val, y_val):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-
-        ax1.plot([0, 1], [0, 1], 'k--', label='Chance')
-        for name in self.results.keys():
-            if name == 'GBM (Baseline)':
-                y_pred_proba = self._get_gbm_predictions(X_val)
-                linestyle = ':'
-            else:
-                y_pred_proba = self.models[name].predict_proba(X_val)[:, 1]
-                linestyle = '-'
-            fpr, tpr, _ = roc_curve(y_val, y_pred_proba)
-            auc = self.results[name]['ROC AUC']
-            ax1.plot(fpr, tpr, linestyle=linestyle, label=f'{name} (AUC = {auc:.3f})')
-
-        ax1.set_title('ROC 曲线')
-        ax1.set_xlabel('False Positive Rate')
-        ax1.set_ylabel('True Positive Rate')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-
-        for name in self.results.keys():
-            if name == 'GBM (Baseline)':
-                y_pred_proba = self._get_gbm_predictions(X_val)
-                linestyle = ':'
-            else:
-                y_pred_proba = self.models[name].predict_proba(X_val)[:, 1]
-                linestyle = '-'
-            CalibrationDisplay.from_predictions(y_val, y_pred_proba, n_bins=10, name=name, ax=ax2, strategy='uniform',
-                                                linestyle=linestyle)
-
-        ax2.set_title('校准曲线')
-        ax2.grid(True, alpha=0.3)
-
+        
+        return results
+    
+    def plot_evaluation_results(self, y_true, predictions, save_path=None):
+        """绘制评估结果图表"""
+        n_models = len(predictions)
+        
+        # ROC曲线
+        plt.figure(figsize=(15, 10))
+        
+        plt.subplot(2, 3, 1)
+        for model_name, y_pred in predictions.items():
+            fpr, tpr, _ = roc_curve(y_true, y_pred)
+            auc = roc_auc_score(y_true, y_pred)
+            plt.plot(fpr, tpr, label=f'{model_name} (AUC={auc:.3f})')
+        plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC曲线')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Precision-Recall曲线
+        plt.subplot(2, 3, 2)
+        for model_name, y_pred in predictions.items():
+            precision, recall, _ = precision_recall_curve(y_true, y_pred)
+            plt.plot(recall, precision, label=model_name)
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall曲线')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 校准曲线
+        plt.subplot(2, 3, 3)
+        for model_name, y_pred in predictions.items():
+            fraction_pos, mean_pred = calibration_curve(y_true, y_pred, n_bins=10)
+            plt.plot(mean_pred, fraction_pos, marker='o', label=model_name)
+        plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
+        plt.xlabel('Mean Predicted Probability')
+        plt.ylabel('Fraction of Positives')
+        plt.title('校准曲线')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 预测概率分布
+        plt.subplot(2, 3, 4)
+        for model_name, y_pred in predictions.items():
+            plt.hist(y_pred, bins=30, alpha=0.5, label=model_name, density=True)
+        plt.xlabel('Predicted Probability')
+        plt.ylabel('Density')
+        plt.title('预测概率分布')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 指标对比
+        plt.subplot(2, 3, 5)
+        metrics = ['roc_auc', 'brier_score', 'log_loss', 'f1_score']
+        model_names = list(predictions.keys())
+        
+        for i, metric in enumerate(metrics):
+            values = [self.results[name][metric] for name in model_names]
+            plt.bar([f"{name}\n{metric}" for name in model_names], values, alpha=0.7)
+        plt.xticks(rotation=45)
+        plt.title('指标对比')
+        plt.grid(True, alpha=0.3)
+        
+        # 混淆矩阵
+        plt.subplot(2, 3, 6)
+        # 选择最佳模型绘制混淆矩阵
+        best_model = max(predictions.keys(), key=lambda x: self.results[x]['roc_auc'])
+        y_pred_best = (predictions[best_model] > 0.5).astype(int)
+        
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(y_true, y_pred_best)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title(f'混淆矩阵 ({best_model})')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        
         plt.tight_layout()
+        if save_path:
+            plt.savefig(f"{save_path}_evaluation.png", dpi=300, bbox_inches='tight')
         plt.show()
 
-
-def run_supervised_learning_benchmark():
-    print("开始监督学习执行概率模型基准测试...")
-
-    data_filename = 'DOGE-USDT-PERP_20250101_merged.npz'
-    snapshot_filename = 'DOGE-USDT-PERP_20250101(1)_eod_fixed.npz'
-    print(f"正在从文件加载数据: {data_filename}")
-    try:
-        full_data = np.load(data_filename)['data']
-        initial_snapshot = np.load(snapshot_filename)['data']
-    except FileNotFoundError as e:
-        print(f"错误: 找不到数据文件 {e.filename}。请确保文件路径正确。")
-        return
-    except KeyError:
-        print("警告: 在 .npz 文件中找不到键 'data'，尝试直接加载。")
-        full_data_load = np.load(data_filename)
-        initial_snapshot_load = np.load(snapshot_filename)
-        full_data = full_data_load[list(full_data_load.keys())[0]]
-        initial_snapshot = initial_snapshot_load[list(initial_snapshot_load.keys())[0]]
-
+def run_execution_probability_prediction(min_horizon_ms=100, max_horizon_ms=1000):
+    """运行完整的执行概率预测流程"""
+    
+    print(f"开始执行概率预测 - 时间范围: {min_horizon_ms}ms - {max_horizon_ms}ms")
+    
+    # 1. 数据收集
+    print("\n第一步：收集数据")
+    
     asset = (
         BacktestAsset()
-        .data([full_data])
-        .initial_snapshot(initial_snapshot)
-        .linear_asset(1.0)
-        .power_prob_queue_model(1.2)
-        .no_partial_fill_exchange()
-        .tick_size(0.00001)
-        .lot_size(1.0)
-        .last_trades_capacity(10000)
+            .data([
+                'DOGE-USDT-PERP_20250101_merged.npz',
+                'DOGE-USDT-PERP_20250102_merged.npz'
+            ])
+            .initial_snapshot('DOGE-USDT-PERP_20250101(1)_eod_fixed.npz')
+            .linear_asset(1.0)
+            .intp_order_latency([
+                'DOGE-USDT-PERP_20250101_merged_latency.npz',
+                'DOGE-USDT-PERP_20250102_merged_latency.npz'
+            ])
+            .power_prob_queue_model(1.2)
+            .no_partial_fill_exchange()
+            .trading_value_fee_model(-0.00005, 0.0002)
+            .tick_size(0.00001)
+            .lot_size(1.0)
+            .roi_lb(0.0)
+            .roi_ub(300.0)
+            .last_trades_capacity(10000)
     )
+
     hbt = ROIVectorMarketDepthBacktest([asset])
+    recorder = Recorder(1, 5_000_000)
 
-    collector = SupervisedDataCollector()
-    X, y = collector.collect(hbt, 0, full_data)
+    # 收集特征数据
+    collector = ForwardLookingDataCollector(
+        min_horizon_ms=min_horizon_ms, 
+        max_horizon_ms=max_horizon_ms, 
+        levels=5
+    )
+    
+    collect_task = collector.collect_data_and_labels(0)
+    market_data, features_list, metadata_list = collect_task(hbt, recorder.recorder)
+    
+    print(f"收集到 {len(features_list)} 个样本")
+    
+    # 2. 生成forward looking标签
+    print("\n第二步：生成标签")
+    
+    labels = collector.generate_labels_from_market_data(market_data, metadata_list)
+    
     hbt.close()
-
-    if len(X) == 0:
-        print("未能收集到任何数据，程序终止。")
-        return
-
-    print(f"数据收集完成。总样本数: {len(X)}, 总标签数: {len(y)}")
-    print(f"标签类别分布: {np.unique(y, return_counts=True)}")
-
-    buy_mask = X[:, 21] == 1.0
-    sell_mask = X[:, 21] == 0.0
-    X_buy, y_buy = X[buy_mask], y[buy_mask]
-    X_sell, y_sell = X[sell_mask], y[sell_mask]
-
-    print(f"\n总样本数: {len(X)}")
-    print(f"买单样本数: {len(X_buy)}, 卖单样本数: {len(X_sell)}")
-
-    models_to_test_template = {
-        'Logistic Regression': LogisticRegression(solver='liblinear', random_state=42, class_weight='balanced'),
-    }
-    if LGB_AVAILABLE:
-        models_to_test_template['LightGBM'] = lgb.LGBMClassifier(random_state=42, n_jobs=-1)
-    if CAT_AVAILABLE:
-        models_to_test_template['CatBoost'] = cb.CatBoostClassifier(random_state=42, verbose=0, thread_count=-1,
-                                                                    auto_class_weights='Balanced')
-
-    if len(X_buy) > 0:
-        buy_benchmarker = ModelBenchmarker(models_to_test_template.copy())
-        buy_benchmarker.run(X_buy, y_buy, data_name="买单(Buy-side)")
-
-    if len(X_sell) > 0:
-        sell_benchmarker = ModelBenchmarker(models_to_test_template.copy())
-        sell_benchmarker.run(X_sell, y_sell, data_name="卖单(Sell-side)")
-
-    print("\n所有基准测试完成！")
-
+    
+    # 转换为numpy数组
+    X = np.array(features_list)
+    y = labels
+    
+    print(f"特征维度: {X.shape}")
+    print(f"正样本比例: {np.mean(y):.3f}")
+    
+    # 3. 数据分割
+    print("\n第三步：分割数据")
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    print(f"训练集大小: {len(X_train)}")
+    print(f"测试集大小: {len(X_test)}")
+    
+    # 4. 模型训练
+    print("\n第四步：训练模型")
+    
+    trainer = ModelTrainer()
+    trainer.train_all_models(X_train, y_train)
+    
+    # 5. 模型预测
+    print("\n第五步：模型预测")
+    
+    predictions = trainer.predict_all_models(X_test)
+    
+    # 6. 模型评估
+    print("\n第六步：模型评估")
+    
+    evaluator = ModelEvaluator()
+    evaluator.evaluate_all_models(y_test, predictions)
+    
+    # 7. 可视化结果
+    print("\n第七步：生成评估图表")
+    
+    evaluator.plot_evaluation_results(
+        y_test, predictions, 
+        save_path=f"execution_prediction_{min_horizon_ms}ms_{max_horizon_ms}ms"
+    )
+    
+    # 8. 保存结果
+    print("\n第八步：保存结果")
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 保存模型
+    with open(f"models_{min_horizon_ms}ms_{max_horizon_ms}ms_{timestamp}.pkl", 'wb') as f:
+        pickle.dump(trainer.models, f)
+    
+    # 保存评估结果
+    results_df = pd.DataFrame(evaluator.results).T
+    results_df.to_csv(f"evaluation_results_{min_horizon_ms}ms_{max_horizon_ms}ms_{timestamp}.csv")
+    
+    print(f"结果已保存")
+    print(f"最佳模型: {max(evaluator.results.keys(), key=lambda x: evaluator.results[x]['roc_auc'])}")
+    
+    return trainer, evaluator, predictions
 
 if __name__ == "__main__":
-    run_supervised_learning_benchmark()
+    # 运行预测任务
+    trainer, evaluator, predictions = run_execution_probability_prediction(
+        min_horizon_ms=0,   # 100ms最小时间
+        max_horizon_ms=1000   # 1000ms最大时间
+    )
+    
+    print("\n任务完成！")
