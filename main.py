@@ -12,7 +12,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.calibration import calibration_curve
 import matplotlib.pyplot as plt
 import seaborn as sns
-import pickle
 from datetime import datetime
 
 # 导入现有的工具函数和类
@@ -564,7 +563,7 @@ def run_execution_probability_prediction(max_horizon_ms=1000):
 if __name__ == "__main__":
     # 运行预测任务
     run_execution_probability_prediction(
-        max_horizon_ms=1000000
+        max_horizon_ms=5_000
     )
     
     print("\n任务完成！")
