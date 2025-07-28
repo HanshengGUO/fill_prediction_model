@@ -135,8 +135,23 @@ def calculate_execution_probability_gbm(order_price, current_price, side, mu, si
     return min(max(prob, 0.0), 1.0)
 
 @njit
-def calculate_order_book_features(depth, levels=5):
-    """计算订单簿特征"""
+def calculate_order_book_features(depth_or_history, levels=5):
+    """计算订单簿特征
+    
+    Args:
+        depth_or_history: 单个depth对象或orderbook历史列表
+        levels: 计算的档位数量
+    """
+    # 判断输入是列表还是单个depth对象
+    if isinstance(depth_or_history, list):
+        # 如果是列表，使用最新的orderbook（列表的最后一个元素）
+        if len(depth_or_history) == 0:
+            return np.zeros(10)
+        depth = depth_or_history[-1]
+    else:
+        # 如果是单个depth对象，直接使用
+        depth = depth_or_history
+    
     if depth.best_bid <= 0 or depth.best_ask <= 0:
         return np.zeros(10)
 
